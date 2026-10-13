@@ -44,6 +44,95 @@ The runner also supports `MAPS_TIMINGS=1`, `MAPS_IMISS_TRACE=1` (requires timing
 using the slice's shared timing, CSV, and calibration reporters. Detailed instruction
 traces can be large on the full network.
 
+Use `--token-progress` (or `MAPS_TOKEN_PROGRESS=1`) to print
+`MAPS_TOKEN_DONE tile=N token=N cycle=N` immediately after each tile processes a token.
+These messages do not wait for the final global barrier. Outgoing asynchronous
+transfers may still be in flight at that point. Progress printing adds overhead,
+so leave it disabled for timing measurements. The SDK build option is
+`make build maps_token_progress=1` (CMake: `-DMAPS_TOKEN_PROGRESS=ON`).
+
+To isolate the eight first-stage shards (original tiles 416–423) from the current
+32×32 allocation on a 4×4 mesh:
+
+```bash
+./.venv/bin/python workloads/mobilevit/diagnostics/isolate-first-stage.py \
+  --mesh-root workloads/mobilevit/results/<run>/32x32
+```
+
+The diagnostic preserves the generated shard shapes, global origins, L1 offsets,
+two token slots, actual inputs/weights, and Spatz task bundle. It reports L2-read
+and operation boundaries and checks every im2col and matmul result against a host
+reference with FP16 rounding after each fused multiply-add. Downstream FIFO sends
+are removed, and the read/compute loop reproduces the normal runner's ordering.
+Results go into `maps-gvsoc-diagnostic/first-stage-4x4/`, including `maps.log`,
+`manifest.json`, and `statistics.json`. This diagnostic assumes this allocation's
+eight 2048-column shards; it does not regenerate an allocation for a smaller mesh.
+It builds separately and restores the SDK's generated mesh header after building.
+
+Use `diagnostics/isolate-first-two-stages.py` with the same `--mesh-root` to
+include the five sigmoid shards (original tiles 228–230 and 261–262) and all
+first-stage-to-second-stage FIFO transfers. This variant uses the actual SDK
+asynchronous FIFO runner and prints dispatcher entry/return values. It removes
+only sends to later stages, checks received inputs and sigmoid outputs exactly
+against FP16 arithmetic replay, and writes `first-two-stages-4x4/` artifacts.
+The sigmoid replay includes the SDK's fast approximation and saturated unsigned
+conversion; its deviation from mathematical sigmoid is recorded separately in
+`manifest.json`. A dispatcher
+error stops the diagnostic after recording it; `--timeout` bounds simulation
+wall time (default 180 seconds). Neither diagnostic changes an existing run.
+The diagnostics bundle the dedicated sigmoid Spatz task and dispatch sigmoid
+through its unary adapter. Inputs and outputs must be contiguous FP16 shards;
+unsupported layouts return an error rather than silently running scalar code.
+
+The two-stage test also checks each first-stage L2 input immediately before
+im2col, which distinguishes input DMA corruption from compute errors. Use
+`--dma-read-trace <test tile>` to record that tile's input DMA burst requests
+and responses in `gvsoc/dma-read.log`; this trace is separate from `maps.log`.
+
+Run a full existing allocation with persistent stage and kernel monitoring:
+
+```bash
+./.venv/bin/python workloads/mobilevit/diagnostics/run-monitored.py \
+  --mesh-root workloads/mobilevit/results/<run>/32x32
+```
+
+This copies the application and builds separately with `MAPS_TOKEN_PROGRESS=1`
+and `MAPS_KERNEL_PROGRESS=1`, without allocation, placement, or instruction tracing.
+The detached monitor writes `progress.json` every 15 seconds, `stage-events.jsonl`
+for stage/token completion, and `maps.log` for raw operation starts and returns.
+Kernel or runtime errors stop only this simulator and produce `kernel-errors.json`
+and `failure.md` with the stage, tile, token, operation, and return code.
+An active operation without a return remains visible in `progress.json`.
+DMA im2col emits `MAPS_KERNEL_STEP` after each kernel plane; its latest step
+and absolute cycle are recorded on the active operation.
+The current diagnostic uses the existing two-token MobileViT input set.
+Use `--stage-limit 10` to retain only the first ten stages at their original
+physical tile positions on the same mesh. Transfers to excluded stages are
+removed and excluded tiles wait at barriers. Stage input dependencies are
+validated before building; final-model output checksums are replaced with
+prefix completion markers.
+A zero kernel return code is not a numerical comparison against reference outputs.
+
+Run increasing MAPS stage prefixes sequentially on the original 32x32 mesh:
+
+```bash
+./.venv/bin/python workloads/mobilevit/diagnostics/run-prefix-series.py \
+  --mesh-root workloads/mobilevit/results/<run>/32x32 --stall-minutes 30
+```
+
+The detached series starts with stage 0, then 0–1, then 0–2, and stops at the
+first build/kernel/simulator failure or suspected stall. Only the MAPS application
+is built; the separate full-mesh example is excluded. The final stage of each
+prefix copies each output shard for both tokens into dedicated packed L2 buffers
+and checks its copy checksum. `MAPS_PREFIX_OUTPUT_DONE` records buffer addresses,
+byte counts and checksums; this proves export completion, not reference accuracy.
+A prefix passes only when all tile/token processing markers, all output-buffer
+markers, and simulator exit 0 are present. `summary.json` tracks the series and
+`prefix-NNN/progress.json` tracks each run. Thirty minutes without any log or
+progress marker stops that run and writes `stall-report.json`; it is a suspected
+stall, not a proof of deadlock. CPU elementwise kernels emit progress every 4096
+elements. The series does not restart or stop unrelated simulations.
+
 Regenerate the frozen artifacts with the repository virtual environment:
 
 ```bash
@@ -55,3 +144,18 @@ The generator retains the SDK's FP16 arithmetic replay to create the weight blob
 layer table; `freeze.py` creates the token corpus, ONNX diagnostics, and SHA-256 manifest.
 Preparation verifies the model, blob, table, and input hashes to prevent mismatched
 artifacts. The generated intermediate `model/layers/` tensors are ignored by Git.
+
+The dedicated hardware adapters can be checked against NumPy references for
+all distinct reshape, transpose, and depthwise layouts in a frozen allocation:
+
+```sh
+./.venv/bin/python workloads/mobilevit/diagnostics/test-hw-adapters.py \
+  --mesh-root workloads/mobilevit/results/<run>/32x32 \
+  --output workloads/mobilevit/results/<run>/32x32/maps-gvsoc-diagnostic/hw-adapters
+```
+
+This focused regression uses a 2×2 simulation and two independent inputs per
+layout. It exercises the same operation dispatcher used by the model: DMA for
+reshape/transpose and a dedicated Spatz task for depthwise convolution with
+FP32 accumulation and FP16 output. `statistics.json` records the result;
+`maps.log` contains each numerical check. Production prefix runs retain 32×32.

@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Build an existing full MobileViT allocation and monitor stages and errors.
+
+No allocation or placement is repeated. Copies the generated application into a
+separate run directory, enables operation and token progress, and runs GVSoC's
+optimized launcher without instruction tracing. The monitor persists after its
+launching terminal exits. A kernel error stops only this simulator process group.
+"""
+
+import argparse
+from collections import defaultdict
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path, data):
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(data, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def add_prefix_outputs(app, output, execution):
+    manifest, declarations, cases = [], [], []
+    for tile in execution['stages'][-1]['submesh']['tile_ids']:
+        path = app / f'src/tiles/tile_{tile:04d}.c'
+        source = path.read_text()
+        final = source.rsplit('.outputs = ', 1)[1].split('\n  },', 1)[0]
+        shapes = re.findall(r'\.shape = \{([^}]+)\}', final)
+        widths = re.findall(r'\.elem_bytes = (\d+)u?', final)
+        ranks = re.findall(r'\.rank = (\d+)u?', final)
+        sizes = []
+        for shape, width, rank in zip(shapes, widths, ranks):
+            n = 1
+            for dim in shape.split(',')[:int(rank)]:
+                n *= int(dim.strip().rstrip('u'))
+            sizes.append(n * int(width))
+        if not sizes or not all(sizes):
+            raise ValueError(f'No terminal outputs on tile {tile}')
+        total = sum(sizes)
+        name = f'maps_prefix_export_{tile}'
+        manifest.append({'tile': tile, 'outputs': sizes, 'bytes_per_token': total})
+        declarations.append(f'extern void {name}(const fifo_tile_plan_t *plan);')
+        cases.append(f'    case {tile}u: {name}(&plan); break;')
+        code = 'static volatile uint8_t @NAME@_buffer[2][@SIZE@]\n    __attribute__((aligned(16), section(".l2_arena.maps_application")));\nvoid @NAME@(const fifo_tile_plan_t *plan) {\n    const op_desc_t *op = &plan->ops[plan->num_ops - 1u];\n    for (uint32_t token = 0; token < 2u; ++token) {\n        uint32_t cursor = 0;\n        for (uint32_t which = 0; which < op->num_outputs; ++which) {\n            const subslice_desc_t *sub = &op->outputs[which];\n            uint32_t count = maps_shape_elems(sub->rank, sub->shape);\n            const volatile uint8_t *src = (const volatile uint8_t *)local_subslice_addr(\n                (const tile_plan_t *)plan, sub, maps_token_slot((const tile_plan_t *)plan, token));\n            uint32_t checksum = 2166136261u, start = cursor;\n            for (uint32_t index = 0; index < count; ++index) {\n                uint32_t remaining = index, offset = 0;\n                for (uint32_t dim = sub->rank; dim-- > 0u;) {\n                    offset += (remaining % sub->shape[dim]) * sub->strides_bytes[dim];\n                    remaining /= sub->shape[dim];\n                }\n                for (uint32_t byte = 0; byte < sub->elem_bytes; ++byte) {\n                    uint8_t value = src[offset + byte];\n                    @NAME@_buffer[token][cursor++] = value;\n                    checksum = (checksum ^ value) * 16777619u;\n                }\n            }\n            asm volatile("fence rw, rw" ::: "memory");\n            uint32_t copied = 2166136261u;\n            for (uint32_t index = start; index < cursor; ++index) {\n                uint32_t value = @NAME@_buffer[token][index];\n                /* Explicitly zero upper bits: the current indexed-byte-load\n                 * checksum path disagrees with byte comparison in GVSoC. */\n                asm volatile("andi %0, %0, 255" : "+r"(value));\n                copied = (copied ^ value) * 16777619u;\n            }\n            if (copied != checksum) {\n                uint32_t mismatches = 0u;\n                for (uint32_t index = 0; index < count; ++index) {\n                    uint32_t remaining = index, offset = 0;\n                    for (uint32_t dim = sub->rank; dim-- > 0u;) {\n                        offset += (remaining % sub->shape[dim]) * sub->strides_bytes[dim];\n                        remaining /= sub->shape[dim];\n                    }\n                    for (uint32_t byte = 0; byte < sub->elem_bytes; ++byte) {\n                        uint32_t packed = start + index * sub->elem_bytes + byte;\n                        uint8_t expected = src[offset + byte];\n                        uint8_t actual = @NAME@_buffer[token][packed];\n                        if (actual != expected) {\n                            if (mismatches < 8u)\n                                printf("MAPS_PREFIX_BYTE_MISMATCH tile=%u token=%u output=%u byte=%u expected=%u actual=%u\\n",\n                                       plan->hartid, token, which, packed - start, expected, actual);\n                            ++mismatches;\n                        }\n                    }\n                }\n                printf("MAPS_PREFIX_OUTPUT_ERROR tile=%u token=%u op=%u output=%u code=-1 expected_checksum=%u actual_checksum=%u mismatches=%u bytes=%u address=%u cycle=%u\\n",\n                       plan->hartid, token, plan->num_ops - 1u, which, checksum, copied,\n                       mismatches, cursor - start, (uint32_t)(uintptr_t)&@NAME@_buffer[token][start], maps_read_cycle());\n                maps_trap();\n            }\n            printf("MAPS_PREFIX_OUTPUT_DONE tile=%u token=%u op=%u output=%u bytes=%u checksum=%u address=%u cycle=%u\\n",\n                   plan->hartid, token, plan->num_ops - 1u, which, cursor - start,\n                   copied, (uint32_t)(uintptr_t)&@NAME@_buffer[token][start], maps_read_cycle());\n        }\n    }\n}\n'.replace('@NAME@', name).replace('@SIZE@', str(total))
+        path.write_text(source + code)
+    atomic_json(output / 'output-buffers.json', manifest)
+    runner = app / 'src/maps_mobilevit_runner.c'
+    source = runner.read_text().replace('int maps_mobilevit_run(void)', '\n'.join(declarations) + '\nint maps_mobilevit_run(void)')
+    anchor = '  fsync_sync_global(&fsync);\n  eu_fsync_wait(&event_unit, MAPS_MOBILEVIT_WAIT_MODE);\n  if (active)\n    maps_fifo_flush_experiment_trace('
+    replacement = '  if (active) {\n    switch (hartid) {\n' + '\n'.join(cases) + '\n    default: break;\n    }\n  }\n' + anchor
+    assert anchor in source
+    runner.write_text(source.replace(anchor, replacement, 1))
+
+
+def limit_stages(mesh_root, app, output, count):
+    execution = json.loads((mesh_root / 'execution-plan.json').read_text())
+    if not 1 <= count <= len(execution['stages']):
+        raise ValueError('Invalid stage limit')
+    execution['stages'] = execution['stages'][:count]
+    retained = {tile for stage in execution['stages'] for tile in stage['submesh']['tile_ids']}
+    atomic_json(output / 'diagnostic-execution-plan.json', execution)
+    for tile in retained:
+        path = app / f'src/tiles/tile_{tile:04d}.c'
+        source = path.read_text()
+        for producer in re.findall(r'\.src_hartid = (\d+)', source):
+            if int(producer) not in retained:
+                raise ValueError(f'Tile {tile} depends on excluded tile {producer}')
+        match = re.search(r'static const fifo_send_desc_t (\w+)\[\] = \{(.*?)\n\};', source, re.S)
+        if match:
+            blocks, depth, begin = [], 0, None
+            for i, character in enumerate(match[2]):
+                if character == '{':
+                    if depth == 0:
+                        begin = i
+                    depth += 1
+                elif character == '}':
+                    depth -= 1
+                    if depth == 0:
+                        block = match[2][begin:i + 1]
+                        destination = int(re.search(r'\.dst_hartid = (\d+)', block)[1])
+                        if destination in retained:
+                            blocks.append(block)
+            assert depth == 0
+            replacement = 'static const fifo_send_desc_t ' + match[1] + '[] = {\n' + ',\n'.join(blocks) + ',\n};' if blocks else ''
+            source = source[:match.start()] + replacement + source[match.end():]
+            source = re.sub(r'\.num_sends = \d+u,', f'.num_sends = {len(blocks)}u,', source)
+            if not blocks:
+                source = re.sub(r'\.sends = [^,]+,', '.sends = 0,', source)
+        path.write_text(source)
+    cmake = app / 'CMakeLists.txt'
+    source = cmake.read_text()
+    source = re.sub(r'^  src/tiles/tile_(\d+)\.c\n', lambda m: m[0] if int(m[1]) in retained else '', source, flags=re.M)
+    cmake.write_text(source)
+    plans = app / 'src/maps_mobilevit.c'
+    source = plans.read_text()
+    source = re.sub(r'^extern const fifo_tile_plan_t maps_mobilevit_tile_(\d+)_plan;\n', lambda m: m[0] if int(m[1]) in retained else '', source, flags=re.M)
+    source = re.sub(r'^  \[(\d+)\] = &maps_mobilevit_tile_\d+_plan,\n', lambda m: m[0] if int(m[1]) in retained else '', source, flags=re.M)
+    plans.write_text(source)
+    runner = app / 'src/maps_mobilevit_runner.c'
+    source = runner.read_text().replace('maps_operation_runtime_init(&runtime)', '(active ? maps_operation_runtime_init(&runtime) : 0)')
+    source = source.replace('maps_mobilevit_handle_output(token);', 'printf("MAPS_PREFIX_DONE stages=' + str(count) + ' token=%u\\n", token);')
+    runner.write_text(source)
+    add_prefix_outputs(app, output, execution)
+    return execution
+
+
+def monitor(mesh_root, output, sdk, command, env):
+    plan_path = output / 'diagnostic-execution-plan.json'
+    execution = json.loads((plan_path if plan_path.exists() else mesh_root / 'execution-plan.json').read_text())
+    stage_for_tile, operations, stages = {}, {}, []
+    for stage_id, stage in enumerate(execution['stages']):
+        tiles = stage['submesh']['tile_ids']
+        stages.append({'stage': stage_id, 'name': stage['name'], 'tiles': tiles})
+        for tile in tiles:
+            if tile in stage_for_tile:
+                raise ValueError(f'Tile {tile} assigned to multiple stages')
+            stage_for_tile[tile] = stage_id
+            source = (output / f'application/src/tiles/tile_{tile:04d}.c').read_text()
+            operations[tile] = re.findall(r'\.kind = (OP_[A-Z0-9_]+),', source)
+    atomic_json(output / 'stage-map.json', stages)
+    tokens = 2
+    buffers = {}
+    output_manifest = output / "output-buffers.json"
+    expected_buffers = sum(len(v["outputs"]) * tokens for v in json.loads(output_manifest.read_text())) if output_manifest.exists() else 0
+    initialized, ready = set(), set()
+    completed, computed = defaultdict(set), defaultdict(set)
+    active, successful, errors = {}, set(), []
+    reported_compute, reported_completion = set(), set()
+    first_start = time.monotonic()
+    last_event = None
+    last_cycle = 0
+    state = 'running'
+    lines_seen = 0
+    process = subprocess.Popen(command, cwd=sdk, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, bufsize=1,
+                               start_new_session=True)
+    (output / 'simulator.pid').write_text(str(process.pid) + '\n')
+    atomic_json(output / 'run.json', {'started_at': now(), 'mesh_root': str(mesh_root),
+                                    'monitor_pid': os.getpid(), 'simulator_pid': process.pid,
+                                    'mesh': execution['mesh']['width'], 'stages': len(stages),
+                                    'tiles': len(stage_for_tile), 'tokens': tokens,
+                                    'command': command, 'model_directory': env.get('GVRUN_MODEL_PATH', str(sdk / 'gvsoc/install/models'))})
+    print(f'RUN_STARTED simulator_pid={process.pid} stages={len(stages)} tiles={len(stage_for_tile)} tokens={tokens}', flush=True)
+    messages = queue.Queue()
+
+    def read_output():
+        for line in process.stdout:
+            messages.put(line)
+        messages.put(None)
+
+    threading.Thread(target=read_output, daemon=True).start()
+
+    def snapshot():
+        rows = []
+        for stage in stages:
+            row = dict(stage)
+            row['tokens'] = []
+            for token in range(tokens):
+                done = completed[(stage['stage'], token)]
+                compute = computed[(stage['stage'], token)]
+                row['tokens'].append({'token': token, 'computed_tiles': len(compute),
+                                      'processed_tiles': len(done), 'total_tiles': len(stage['tiles']),
+                                      'compute_complete': len(compute) == len(stage['tiles']),
+                                      'processing_complete': len(done) == len(stage['tiles']),
+                                      'pending_tiles': sorted(set(stage['tiles']) - done)})
+            rows.append(row)
+        atomic_json(output / 'progress.json', {'checked_at': now(), 'state': state,
+                                             'wall_seconds': time.monotonic() - first_start,
+                                             'simulator_pid': process.pid,
+                                             'initialized_tiles': len(initialized), 'ready_tiles': len(ready),
+                                             'total_tiles': len(stage_for_tile), 'tokens': tokens,
+                                             'completed_tile_tokens': sum(len(v) for v in completed.values()),
+                                             'successful_kernel_calls': len(successful),
+                                             'output_buffers_completed': len(buffers),
+                                             'expected_output_buffers': expected_buffers,
+                                             'output_buffers': list(buffers.values()),
+                                             'last_observed_cycle': last_cycle, 'last_event_at': last_event,
+                                             'log_lines': lines_seen, 'errors': errors,
+                                             'active_kernels': sorted(active.values(), key=lambda r: (r['stage'], r['tile'])),
+                                             'stages': rows,
+                                             'note': 'Kernel success means return code zero, not numerical verification. Tile/token processing completion may precede outgoing DMA drain.'})
+        atomic_json(output / 'kernel-errors.json', errors)
+
+    def stop_simulator():
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+
+    marker = re.compile(r'(MAPS_PREFIX_OUTPUT_DONE|MAPS_PREFIX_OUTPUT_ERROR|MAPS_KERNEL_STEP|MAPS_KERNEL_BEGIN|MAPS_KERNEL_DONE|MAPS_KERNEL_ERROR|MAPS_RUNTIME_ERROR|MAPS_INIT_DONE|MAPS_INIT_ERROR|MAPS_TILE_READY|MAPS_TOKEN_DONE)\b(.*)')
+    values = re.compile(r'(\w+)=([^\s]+)')
+    next_snapshot = 0
+    snapshot()
+    with (output / 'maps.log').open('w', buffering=1) as log, (output / 'stage-events.jsonl').open('w', buffering=1) as events:
+        while True:
+            try:
+                line = messages.get(timeout=1)
+            except queue.Empty:
+                line = ''
+            if line is None:
+                break
+            if line:
+                log.write(line)
+                lines_seen += 1
+                match = marker.search(line)
+                if match:
+                    kind, rest = match.groups()
+                    data = dict(values.findall(rest))
+                    tile = int(data['tile'])
+                    stage_id = stage_for_tile.get(tile, -1)
+                    token, op = int(data.get('token', -1)), int(data.get('op', -1))
+                    last_event = now()
+                    if 'cycle' in data:
+                        last_cycle = max(last_cycle, int(data['cycle']))
+                    record = {'observed_at': last_event, 'stage': stage_id, 'stage_name': stages[stage_id]['name'] if stage_id >= 0 else None,
+                              'tile': tile, 'token': token, 'op': op,
+                              'operation': operations[tile][op] if tile in operations and 0 <= op < len(operations[tile]) else None,
+                              'marker': kind, 'details': data}
+                    if kind == 'MAPS_INIT_DONE':
+                        if tile in stage_for_tile:
+                            initialized.add(tile)
+                    elif kind == 'MAPS_TILE_READY':
+                        if tile in stage_for_tile:
+                            ready.add(tile)
+                    elif kind == 'MAPS_PREFIX_OUTPUT_DONE':
+                        buffers[(tile, token, int(data['output']))] = record
+                        events.write(json.dumps(record) + '\n')
+                    elif kind == 'MAPS_KERNEL_BEGIN':
+                        active[tile] = record
+                    elif kind == 'MAPS_KERNEL_STEP':
+                        if tile in active:
+                            active[tile]['latest_step'] = data
+                            active[tile]['progress_at'] = last_event
+                    elif kind == 'MAPS_KERNEL_DONE':
+                        active.pop(tile, None)
+                        successful.add((tile, token, op))
+                        if op == len(operations[tile]) - 1:
+                            computed[(stage_id, token)].add(tile)
+                    elif kind == 'MAPS_TOKEN_DONE':
+                        completed[(stage_id, token)].add(tile)
+                    else:
+                        errors.append(record)
+                        state = 'kernel_failed' if kind == 'MAPS_KERNEL_ERROR' else 'runtime_failed'
+                        print('FAILURE ' + json.dumps(record), flush=True)
+                        events.write(json.dumps(record) + '\n')
+                        snapshot()
+                        stop_simulator()
+                    for bucket, reported, event in [(computed, reported_compute, 'STAGE_COMPUTE_DONE'),
+                                                      (completed, reported_completion, 'STAGE_PROCESSING_DONE')]:
+                        key = (stage_id, token)
+                        if stage_id >= 0 and token >= 0 and key not in reported and len(bucket[key]) == len(stages[stage_id]['tiles']):
+                            reported.add(key)
+                            result = {'event': event, 'stage': stage_id, 'token': token,
+                                      'name': stages[stage_id]['name'], 'tiles': len(bucket[key]), 'observed_at': now()}
+                            events.write(json.dumps(result) + '\n')
+                            print(f'{event} stage={stage_id} token={token} tiles={len(bucket[key])} name={stages[stage_id]["name"]}', flush=True)
+            if time.monotonic() >= next_snapshot:
+                snapshot()
+                next_snapshot = time.monotonic() + 15
+        result = process.wait()
+    expected = len(stage_for_tile) * tokens
+    complete = sum(len(v) for v in completed.values()) == expected and len(buffers) == expected_buffers
+    if not errors:
+        state = 'completed' if result == 0 and complete else 'simulator_failed'
+    if state == 'simulator_failed':
+        errors.append({'marker': 'SIMULATOR_EXIT', 'code': result, 'observed_at': now(),
+                       'completed_tile_tokens': sum(len(v) for v in completed.values()), 'expected_tile_tokens': expected})
+    snapshot()
+    (output / 'exit-status').write_text(str(result) + '\n')
+    if errors:
+        (output / 'failure.md').write_text('# MobileViT monitored run failure\n\n```json\n' + json.dumps(errors, indent=2) + '\n```\n\nSee progress.json for active kernels and pending tiles, and maps.log for raw output.\n')
+    print(f'RUN_FINISHED state={state} exit_status={result} completed_tile_tokens={sum(len(v) for v in completed.values())}/{expected}', flush=True)
+    return 0 if state == 'completed' else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--mesh-root', required=True, type=Path)
+    parser.add_argument('--sdk-root', type=Path, default=Path('/home/zaino/repos/magia-sdk-v3'))
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--stage-limit', type=int, help='run only the first N stages on the original mesh')
+    parser.add_argument('--foreground', action='store_true', help='run the monitor in this process')
+    args = parser.parse_args()
+    mesh_root, sdk = args.mesh_root.resolve(), args.sdk_root.resolve()
+    output = (args.output or mesh_root / 'maps-gvsoc-diagnostic' / ('full-monitored-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    if not args.foreground:
+        command = [sys.executable, '-u', str(Path(__file__).resolve()), '--mesh-root', str(mesh_root),
+                   '--sdk-root', str(sdk), '--output', str(output), '--foreground']
+        if args.stage_limit is not None:
+            command.extend(['--stage-limit', str(args.stage_limit)])
+        with (output / 'monitor.log').open('w') as log:
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        (output / 'monitor.pid').write_text(str(process.pid) + '\n')
+        print(json.dumps({'monitor_pid': process.pid, 'output': str(output)}, indent=2))
+        return 0
+    (output / 'monitor.pid').write_text(str(os.getpid()) + '\n')
+    atomic_json(output / 'progress.json', {'state': 'building', 'checked_at': now()})
+    app = output / 'application'
+    shutil.copytree(mesh_root / 'maps-application', app, dirs_exist_ok=True)
+    cmake = app / 'CMakeLists.txt'
+    source = cmake.read_text()
+    if 'depthwise_conv/spatz_task/depthwise_conv_fp16_spatz_task.c' not in source:
+        source = source.replace('  TASK_SOURCES\n', '  TASK_SOURCES\n    ${MAPS_SPATZ_KERNELS_DIR}/depthwise_conv/spatz_task/depthwise_conv_fp16_spatz_task.c\n')
+        source = source.replace('  INCLUDE_DIRS\n', '  INCLUDE_DIRS\n    ${MAPS_SPATZ_KERNELS_DIR}/depthwise_conv/include\n')
+    if 'MAPS_HAS_DEPTHWISE_CONV_SPATZ_TASK=1' not in source:
+        source += '\ntarget_compile_definitions(maps_mobilevit PRIVATE MAPS_HAS_DEPTHWISE_CONV_SPATZ_TASK=1)\n'
+    if 'sigmoid/spatz_task/sigmoid_fp16_spatz_task.c' not in source:
+        source = source.replace('  TASK_SOURCES\n', '  TASK_SOURCES\n    ${MAPS_SPATZ_KERNELS_DIR}/sigmoid/spatz_task/sigmoid_fp16_spatz_task.c\n')
+        source = source.replace('  INCLUDE_DIRS\n', '  INCLUDE_DIRS\n    ${MAPS_SPATZ_KERNELS_DIR}/sigmoid/include\n')
+    if 'MAPS_HAS_SIGMOID_SPATZ_TASK=1' not in source:
+        source += '\ntarget_compile_definitions(maps_mobilevit PRIVATE MAPS_HAS_SIGMOID_SPATZ_TASK=1)\n'
+    source = re.sub(r'^add_subdirectory\([^\n]*full_mesh\)\n', '', source, flags=re.M)
+    source = re.sub(r'target_compile_definitions\(maps_mobilevit PRIVATE\s+MAPS_EXPERIMENT_TRACE=1\s*\)', '', source)
+    cmake.write_text(source)
+    runner = app / 'src/maps_mobilevit_runner.c'
+    source = runner.read_text()
+    if 'runtime.depthwise_conv_fp16_task =' not in source:
+        source = source.replace('  runtime.relu_fp16_task =', '  runtime.depthwise_conv_fp16_task = DEPTHWISE_CONV_FP16_SPATZ_TASK;\n  runtime.relu_fp16_task =', 1)
+    if 'runtime.sigmoid_fp16_task =' not in source:
+        source = source.replace('  runtime.relu_fp16_task =', '  runtime.sigmoid_fp16_task = SIGMOID_FP16_SPATZ_TASK;\n  runtime.relu_fp16_task =', 1)
+    source = source.replace('if (maps_operation_runtime_init(&runtime) != 0)\n    return -1;', '''int init_result = maps_operation_runtime_init(&runtime);
+  if (init_result != 0) {
+    printf("MAPS_INIT_ERROR tile=%u code=%d\\n", hartid, init_result);
+    return -1;
+  }
+  printf("MAPS_INIT_DONE tile=%u cycle=%u\\n", hartid, maps_read_cycle());''')
+    source = source.replace('maps_fifo_init_tile(&plan, &idma, &event_unit);', '''maps_fifo_init_tile(&plan, &idma, &event_unit);
+  printf("MAPS_TILE_READY tile=%u cycle=%u\\n", hartid, maps_read_cycle());''')
+    runner.write_text(source)
+    if args.stage_limit is not None:
+        limit_stages(mesh_root, app, output, args.stage_limit)
+    env = os.environ.copy()
+    tools = Path('/home/zaino/repos/toolchains')
+    llvm = tools / 'llvm20-root/usr/lib/llvm-20'
+    env['LLVM_INSTALL_DIR'] = str(llvm)
+    env['LD_LIBRARY_PATH'] = str(llvm.parent / 'x86_64-linux-gnu') + ':' + env.get('LD_LIBRARY_PATH', '')
+    env['PATH'] = str(Path(sys.executable).parent) + ':' + str(tools / 'pulp-toolchain/bin') + ':' + env['PATH']
+    env['CMAKE_BUILD_PARALLEL_LEVEL'] = '8'
+    execution = json.loads((mesh_root / 'execution-plan.json').read_text())
+    mesh_size = execution['mesh']['width']
+    assert mesh_size == execution['mesh']['height']
+    build = output / 'sdk-build'
+    config = sdk / 'targets/magia_v3/include/addr_map/tile_config.h'
+    saved = config.read_bytes()
+    try:
+        with (output / 'build.log').open('w') as log:
+            for target in ['spatz_bootrom', 'maps_mobilevit']:
+                subprocess.run(['make', 'build', f'tiles={mesh_size}', f'CMAKE_BUILDDIR={build}',
+                                f'maps_application_dir={app}', 'maps_token_progress=1',
+                                'maps_kernel_progress=1', 'maps_experiment_trace=0', f'test={target}'],
+                               cwd=sdk, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    except subprocess.CalledProcessError as error:
+        atomic_json(output / 'progress.json', {'state': 'build_failed', 'checked_at': now(), 'code': error.returncode})
+        raise
+    finally:
+        config.write_bytes(saved)
+    work = output / 'gvsoc'
+    work.mkdir(exist_ok=True)
+    command = ['stdbuf', '-oL', '-eL', str(sdk / 'gvsoc/install/bin/gvrun'), '--target', 'magia_v3',
+               '--param', f'binary={build}/bin/maps_mobilevit', '--work-dir', str(work),
+               '--attr', f'magia_v3/n_tiles_x={mesh_size}', '--attr', f'magia_v3/n_tiles_y={mesh_size}',
+               '--attr', f'magia_v3/spatz_romfile={build}/bin/bootrom/spatz_init.bin', 'run']
+    return monitor(mesh_root, output, sdk, command, env)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

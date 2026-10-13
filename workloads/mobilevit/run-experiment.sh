@@ -2,13 +2,14 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 [--tokens N] [--token-slots N]"
+  echo "usage: $0 [--tokens N] [--token-slots N] [--token-progress]"
 }
 
 tokens=2
 token_slots=2
 maps_timings="${MAPS_TIMINGS:-0}"
 maps_imiss_trace="${MAPS_IMISS_TRACE:-0}"
+maps_token_progress="${MAPS_TOKEN_PROGRESS:-0}"
 communication_weight="${COMMUNICATION_WEIGHT:-1.0}"
 if [[ "$maps_timings" != 0 && "$maps_timings" != 1 ]]; then
   echo "MAPS_TIMINGS must be 0 or 1" >&2
@@ -16,6 +17,10 @@ if [[ "$maps_timings" != 0 && "$maps_timings" != 1 ]]; then
 fi
 if [[ "$maps_imiss_trace" != 0 && "$maps_imiss_trace" != 1 ]]; then
   echo "MAPS_IMISS_TRACE must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$maps_token_progress" != 0 && "$maps_token_progress" != 1 ]]; then
+  echo "MAPS_TOKEN_PROGRESS must be 0 or 1" >&2
   exit 2
 fi
 if [[ "$maps_imiss_trace" == 1 && "$maps_timings" != 1 ]]; then
@@ -34,6 +39,10 @@ while (($#)); do
     token_slots="$2"
     shift 2
     ;;
+  --token-progress)
+    maps_token_progress=1
+    shift
+    ;;
   -h | --help)
     usage
     exit 0
@@ -50,7 +59,7 @@ if [[ ! "$tokens" =~ ^[1-9][0-9]*$ || "$tokens" -gt 16 || ! "$token_slots" =~ ^[
   exit 2
 fi
 
-printf 'MobileViT run: execution tokens=%s, token slots=%s\n' "$tokens" "$token_slots"
+printf 'MobileViT run: execution tokens=%s, token slots=%s, token progress=%s\n' "$tokens" "$token_slots" "$maps_token_progress"
 
 experiment_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd "$experiment_root/../.." && pwd)"
@@ -146,6 +155,7 @@ EOF
     tiles="$tiles"
     CMAKE_BUILDDIR="$sdk_build"
     maps_application_dir="$application"
+    maps_token_progress="$maps_token_progress"
   )
   if ((maps_timings)); then
     sdk_build_args+=(maps_experiment_trace=0)
