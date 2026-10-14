@@ -79,6 +79,7 @@ def generate(mesh_root, output):
         text = re.sub(r'\.num_sends = \d+u,', f'.num_sends = {len(sends)}u,', text)
         if not sends:
             text = re.sub(r'\.sends = [^,]+,', '.sends = 0,', text)
+            text = text.replace(f'sizeof({sends_name})', '0u')
         text = re.sub(r'(\.(?:owner_hartid|src_hartid|dst_hartid|hartid) = )(\d+)(u?)(,)',
                       lambda m: m[1] + str(mapping[int(m[2])]) + m[3] + m[4], text)
         (app / f'tile_{tile}.c').write_text(text)
@@ -135,10 +136,12 @@ def generate(mesh_root, output):
 #include "utils/maps_operations.h"
 #undef maps_execute_operation
 static uint32_t isolated_check_input(const tile_plan_t *plan, const op_desc_t *op, uint32_t slot);
+static uint32_t isolated_check_received(const tile_plan_t *plan, const op_desc_t *op, uint32_t slot);
 static inline int maps_execute_operation(const tile_plan_t *plan, const op_desc_t *op,
                                           uint32_t slot, maps_operation_runtime_t *runtime)
 {
     if (op->kind == OP_IM2COL) isolated_check_input(plan, op, slot);
+    else if (plan->hartid >= 8u && op->kind == OP_SIGMOID) isolated_check_received(plan, op, slot);
     uint32_t start = maps_read_cycle();
     printf("TWO_STAGE_OP_BEGIN tile=%u slot=%u kind=%u cycle=%u\\n", plan->hartid, slot, op->kind, start);
     int result = isolated_base_execute_operation(plan, op, slot, runtime);
@@ -164,19 +167,30 @@ static inline int maps_execute_operation(const tile_plan_t *plan, const op_desc_
     return bad;
 }
 
+/* A received input is used in place: during the token its slice aliases the
+ * FIFO slot, which is released afterwards, so check it as the operation sees it. */
+static uint32_t isolated_check_received(const tile_plan_t *plan, const op_desc_t *op, uint32_t slot)
+{
+    uint32_t tile = plan->hartid, count = counts[tile][0];
+    const uint16_t *data = (const uint16_t *)local_subslice_addr(plan, &op->inputs[0], slot);
+    uint32_t bad = check(data, golden[tile][0] + slot * count, count, tile, slot, 0u);
+    errors[tile] += bad;
+    return bad;
+}
+
 int main(void)''')
     main = main.replace('hartid < 8', 'hartid < 13')
     begin = main.index('        /* Same read/compute ordering')
     end = main.index('\n    }\n    fsync_sync_global', begin)
     main = main[:begin] + '''        printf("TWO_STAGE_RUN_BEGIN tile=%u cycle=%u\\n", hartid, maps_read_cycle());
-        maps_fifo_run_tile_tokens(&plan, 2u, &idma, &eu);
+        maps_fifo_run_tile_tokens(&plan, 2u);
         printf("TWO_STAGE_RUN_DONE tile=%u cycle=%u\\n", hartid, maps_read_cycle());
         for (uint32_t token = 0; token < 2; ++token) {
             uint32_t slot = maps_token_slot((const tile_plan_t *)&plan, token);
-            for (uint32_t which = 0; which < 2; ++which) {
+            /* Stage 1's received input was checked as the sigmoid read it. */
+            for (uint32_t which = hartid < 8 ? 0u : 1u; which < 2; ++which) {
                 const subslice_desc_t *sub = hartid < 8
-                    ? &plan.ops[which].outputs[0]
-                    : (which == 0 ? &plan.ops[0].inputs[0] : &plan.ops[0].outputs[0]);
+                    ? &plan.ops[which].outputs[0] : &plan.ops[0].outputs[0];
                 const uint16_t *data = (const uint16_t *)local_subslice_addr((const tile_plan_t *)&plan, sub, slot);
                 uint32_t count = counts[hartid][which];
                 errors[hartid] += check(data, golden[hartid][which] + token * count,

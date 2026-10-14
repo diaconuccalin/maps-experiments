@@ -51,6 +51,13 @@ transfers may still be in flight at that point. Progress printing adds overhead,
 so leave it disabled for timing measurements. The SDK build option is
 `make build maps_token_progress=1` (CMake: `-DMAPS_TOKEN_PROGRESS=ON`).
 
+The diagnostics below build and simulate like `run-experiment.sh`: the SDK comes
+from `MAGIA_SDK_ROOT` (or `--sdk-root` where offered), the toolchains from the
+environment (`source ../maps-env.sh`), the SDK is built with `PULP_CORES` (default
+0) and GVSoC runs with `GVSOC_PULP_CORES` (default 8) idle PULP cores per tile.
+Each one first runs `make gvsoc` for its mesh, then builds in its own output
+directory without touching the SDK tree.
+
 To isolate the eight first-stage shards (original tiles 416–423) from the current
 32×32 allocation on a 4×4 mesh:
 
@@ -67,7 +74,6 @@ are removed, and the read/compute loop reproduces the normal runner's ordering.
 Results go into `maps-gvsoc-diagnostic/first-stage-4x4/`, including `maps.log`,
 `manifest.json`, and `statistics.json`. This diagnostic assumes this allocation's
 eight 2048-column shards; it does not regenerate an allocation for a smaller mesh.
-It builds separately and restores the SDK's generated mesh header after building.
 
 Use `diagnostics/isolate-first-two-stages.py` with the same `--mesh-root` to
 include the five sigmoid shards (original tiles 228–230 and 261–262) and all
@@ -85,9 +91,13 @@ through its unary adapter. Inputs and outputs must be contiguous FP16 shards;
 unsupported layouts return an error rather than silently running scalar code.
 
 The two-stage test also checks each first-stage L2 input immediately before
-im2col, which distinguishes input DMA corruption from compute errors. Use
-`--dma-read-trace <test tile>` to record that tile's input DMA burst requests
-and responses in `gvsoc/dma-read.log`; this trace is separate from `maps.log`.
+im2col, which distinguishes input DMA corruption from compute errors. Received
+sigmoid inputs are checked as the dispatcher sees them: the runtime reads them in
+place from the FIFO slot, which it releases after the token. Use
+`--dma-read-trace <test tile>` to record that tile's AXI-to-OBI iDMA read bursts
+(issue and completion) in `gvsoc/dma-read.log`; this trace is separate from
+`maps.log`. `diagnostics/analyze-dma-read-order.py gvsoc/dma-read.log` reports
+bursts that complete ahead of earlier ones.
 
 Run a full existing allocation with persistent stage and kernel monitoring:
 
@@ -158,4 +168,6 @@ This focused regression uses a 2×2 simulation and two independent inputs per
 layout. It exercises the same operation dispatcher used by the model: DMA for
 reshape/transpose and a dedicated Spatz task for depthwise convolution with
 FP32 accumulation and FP16 output. `statistics.json` records the result;
-`maps.log` contains each numerical check. Production prefix runs retain 32×32.
+`maps.log` contains each numerical check. `--timeout` bounds simulation wall
+time (default 3600 seconds; the 151 layouts of the current allocation take
+about 19 minutes). Production prefix runs retain 32×32.

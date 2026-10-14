@@ -19,6 +19,8 @@ import time
 
 import numpy as np
 
+import magia_sdk
+
 
 def generate(mesh_root, output):
     original = mesh_root / "maps-application"
@@ -77,6 +79,8 @@ def generate(mesh_root, output):
         plan_text = source[source.index('_Static_assert(FIFO_HEADER_SIZE'):]
         plan_text = re.sub(r'\.num_sends = \d+u,', '.num_sends = 0u,', plan_text)
         plan_text = re.sub(r'\.sends = [^,]+,', '.sends = 0,', plan_text)
+        # The sends array is gone; the L1 descriptor-copy assertion sizes it.
+        plan_text = plan_text.replace(f'sizeof(maps_mobilevit_tile_{old}_sends)', '0u')
         text = prefix + plan_text
         text = text.replace(f'.owner_hartid = {old},', f'.owner_hartid = {tile},')
         text = text.replace(f'.hartid = {old}u,', f'.hartid = {tile}u,')
@@ -90,9 +94,9 @@ def generate(mesh_root, output):
     (app / 'data.S').write_text('\n'.join(asm) + '\n')
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     bundle = (original / 'CMakeLists.txt').read_text().split('add_executable(', 1)[0]
-    if 'sigmoid/spatz_task/sigmoid_fp16_spatz_task.c' not in bundle:
-        bundle = bundle.replace('  TASK_SOURCES\n', '  TASK_SOURCES\n    ${MAPS_SPATZ_KERNELS_DIR}/sigmoid/spatz_task/sigmoid_fp16_spatz_task.c\n')
-        bundle = bundle.replace('  INCLUDE_DIRS\n', '  INCLUDE_DIRS\n    ${MAPS_SPATZ_KERNELS_DIR}/sigmoid/include\n')
+    if 'sigmoid/fp16/spatz/spatz_task/sigmoid_fp16_spatz_task.c' not in bundle:
+        bundle = bundle.replace('  TASK_SOURCES\n', '  TASK_SOURCES\n    ${MAPS_SPATZ_KERNELS_DIR}/sigmoid/fp16/spatz/spatz_task/sigmoid_fp16_spatz_task.c\n')
+        bundle = bundle.replace('  INCLUDE_DIRS\n', '  INCLUDE_DIRS\n    ${MAPS_SPATZ_KERNELS_DIR}/sigmoid/fp16/spatz/include\n')
     cmake = bundle.replace('set(MAPS_APPLICATION maps_mobilevit)', 'set(MAPS_APPLICATION maps_mobilevit_first_stage)')
     cmake += '\nadd_executable(${MAPS_APPLICATION} main.c data.S\n' + ''.join(f'  tile_{i}.c\n' for i in range(8)) + ')\n'
     cmake += '''target_compile_options(${MAPS_APPLICATION} PRIVATE -O2)
@@ -140,34 +144,33 @@ static uint32_t check(const uint16_t *actual, const uint16_t *expected,
 int main(void)
 {
     const uint32_t hartid = get_hartid();
-    idma_config_t ic = {.hartid = hartid};
-    idma_controller_t idma = {.base = 0, .cfg = &ic, .api = &idma_api};
-    redmule_config_t rc = {.hartid = hartid};
-    redmule_controller_t redmule = {.base = 0, .cfg = &rc, .api = &redmule_api};
-    fsync_config_t fc = {.hartid = hartid};
-    fsync_controller_t fsync = {.base = 0, .cfg = &fc, .api = &fsync_api};
-    eu_config_t ec = {.hartid = hartid};
-    eu_controller_t eu = {.base = 0, .cfg = &ec, .api = &eu_api};
-    idma_init(&idma); redmule_init(&redmule); fsync_init(&fsync); eu_init(&eu);
+    idma_init(); redmule_init(); fsync_init(); eu_init();
     eu_clear_events(0xffffffffu);
-    eu_fsync_init(&eu, 0u); eu_idma_init(&eu, 0u); eu_redmule_init(&eu, 0u);
-    maps_operation_runtime_t runtime = {
-        .idma_ctrl = &idma, .redmule_ctrl = &redmule, .eu_ctrl = &eu,
-        .kernel_abi_version = 2u, .task_bundle_abi_version = 2u,
-        .spatz_binary_start = SPATZ_BINARY_START,
-        .spatz_params = (void *)(get_l1_base(hartid) + MAPS_OPERATION_TASK_SCRATCH_OFFSET),
-        .spatz_params_bytes = MAPS_OPERATION_TASK_SCRATCH_BYTES,
-        .add_fp16_task = ADD_FP16_SPATZ_TASK, .mul_bcast_fp16_task = MUL_BCAST_FP16_SPATZ_TASK,
-        .matmul_fp16_task = MATMUL_FP16_SPATZ_TASK, .relu_fp16_task = RELU_FP16_SPATZ_TASK,
-        .sigmoid_fp16_task = SIGMOID_FP16_SPATZ_TASK,
-        .softmax_exp_fp16_task = SOFTMAX_EXP_FP16_SPATZ_TASK,
-        .group_reduce_fp16_task = GROUP_REDUCE_FP16_SPATZ_TASK,
-        .group_centered_reduce_fp16_task = GROUP_CENTERED_REDUCE_FP16_SPATZ_TASK,
-        .group_normalize_fp16_task = GROUP_NORMALIZE_FP16_SPATZ_TASK,
-        .reducesum_fp16_task = REDUCESUM_FP16_SPATZ_TASK,
-        .reducemax_fp16_task = REDUCEMAX_FP16_SPATZ_TASK,
-        .binary_bcast_fp16_task = BINARY_BCAST_FP16_SPATZ_TASK,
-    };
+    eu_fsync_init(0u); eu_idma_init(0u); eu_redmule_init(0u);
+    /* Field by field, like the generated runner: CORE-V GCC ICEs (maybe_postinc)
+     * on a zero-filled designated initialiser. */
+    maps_operation_runtime_t runtime;
+    runtime.kernel_abi_version = MAPS_KERNEL_ABI_VERSION;
+    runtime.task_bundle_abi_version = MAPS_TASK_BUNDLE_ABI_VERSION;
+    runtime.spatz_binary_start = SPATZ_BINARY_START;
+    runtime.spatz_params = (void *)(get_l1_base(hartid) + MAPS_OPERATION_TASK_SCRATCH_OFFSET);
+    runtime.spatz_params_bytes = MAPS_OPERATION_TASK_SCRATCH_BYTES;
+    runtime.spatz_initialized = 0u;
+    runtime.background = 0;
+    runtime.background_ctx = 0;
+    runtime.add_fp16_task = ADD_FP16_SPATZ_TASK;
+    runtime.mul_bcast_fp16_task = MUL_BCAST_FP16_SPATZ_TASK;
+    runtime.matmul_fp16_task = MATMUL_ROWS_FP16_SPATZ_TASK;
+    runtime.relu_fp16_task = RELU_FP16_SPATZ_TASK;
+    runtime.sigmoid_fp16_task = SIGMOID_FP16_SPATZ_TASK;
+    runtime.depthwise_conv_fp16_task = 0u;
+    runtime.softmax_exp_fp16_task = SOFTMAX_EXP_FP16_SPATZ_TASK;
+    runtime.group_reduce_fp16_task = GROUP_REDUCE_FP16_SPATZ_TASK;
+    runtime.group_centered_reduce_fp16_task = GROUP_CENTERED_REDUCE_FP16_SPATZ_TASK;
+    runtime.group_normalize_fp16_task = GROUP_NORMALIZE_FP16_SPATZ_TASK;
+    runtime.reducesum_fp16_task = REDUCESUM_FP16_SPATZ_TASK;
+    runtime.reducemax_fp16_task = REDUCEMAX_FP16_SPATZ_TASK;
+    runtime.binary_bcast_fp16_task = BINARY_BCAST_FP16_SPATZ_TASK;
     printf("FIRST_STAGE_INIT tile=%u cycle=%u\n", hartid, maps_read_cycle());
     if (maps_operation_runtime_init(&runtime) != 0) return -1;
     errors[hartid] = 0;
@@ -178,9 +181,10 @@ int main(void)
         plan.operation_runtime = &runtime;
         maps_fifo_init(&plan);
     }
-    fsync_sync_global(&fsync); eu_fsync_wait(&eu, WFE);
-    if (hartid < 8) maps_fifo_init_tile(&plan, &idma, &eu);
-    fsync_sync_global(&fsync); eu_fsync_wait(&eu, WFE);
+    fsync_sync_global(); eu_fsync_wait(WFE);
+    /* Like the generated runner: descriptors to L1, then the initializer reads. */
+    if (hartid < 8) { maps_fifo_plan_to_l1(&plan); maps_fifo_init_tile(&plan); }
+    fsync_sync_global(); eu_fsync_wait(WFE);
     if (hartid < 8) {
         /* Same read/compute ordering as maps_fifo_run_tile_tokens; stage
          * outputs terminate here so there are no downstream FIFO sends. */
@@ -188,7 +192,7 @@ int main(void)
             uint32_t slot = maps_token_slot((const tile_plan_t *)&plan, token);
             printf("FIRST_STAGE_READ_BEGIN tile=%u token=%u cycle=%u\n", hartid, token, maps_read_cycle());
             for (uint32_t i = 0; i < plan.num_l2_reads; ++i)
-                issue_l2_read_token((const tile_plan_t *)&plan, &plan.l2_reads[i], token, slot, &idma, &eu);
+                issue_l2_read_token((const tile_plan_t *)&plan, &plan.l2_reads[i], token, slot);
             printf("FIRST_STAGE_READ_DONE tile=%u token=%u cycle=%u\n", hartid, token, maps_read_cycle());
             for (uint32_t op = 0; op < plan.num_ops; ++op) {
                 uint32_t start = maps_read_cycle();
@@ -205,7 +209,7 @@ int main(void)
             printf("MAPS_TOKEN_DONE tile=%u token=%u cycle=%u\n", hartid, token, maps_read_cycle());
         }
     }
-    fsync_sync_global(&fsync); eu_fsync_wait(&eu, WFE);
+    fsync_sync_global(); eu_fsync_wait(WFE);
     uint32_t total = 0;
     for (uint32_t i = 0; i < 16; ++i) total += errors[i];
     if (hartid == 0) printf("FIRST_STAGE_RESULT errors=%u active_tiles=8 tokens=2\n", total);
@@ -253,7 +257,7 @@ def summarize(output):
 def main(target='maps_mobilevit_first_stage', output_name='first-stage-4x4', mesh_size=4):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mesh-root', required=True, type=Path)
-    parser.add_argument('--sdk-root', type=Path, default=Path('/home/zaino/repos/magia-sdk-v3'))
+    parser.add_argument('--sdk-root', type=Path, default=magia_sdk.default_sdk_root())
     parser.add_argument('--output', type=Path)
     parser.add_argument('--generate-only', action='store_true')
     parser.add_argument('--timeout', type=float, default=180,
@@ -263,55 +267,37 @@ def main(target='maps_mobilevit_first_stage', output_name='first-stage-4x4', mes
     parser.add_argument('--dma-read-trace', type=int,
                         help='trace the selected tile\'s input DMA AXI reads')
     args = parser.parse_args()
+    args.sdk_root = args.sdk_root.resolve()
     output = (args.output or args.mesh_root / 'maps-gvsoc-diagnostic' / output_name).resolve()
     output.mkdir(parents=True, exist_ok=True)
     app = generate(args.mesh_root.resolve(), output)
     if args.blocking_fifo:
         source = (app / 'main.c').read_text()
-        call = 'maps_fifo_run_tile_tokens(&plan, 2u, &idma, &eu);'
+        call = 'maps_fifo_run_tile_tokens(&plan, 2u);'
         if call not in source:
             parser.error('--blocking-fifo requires the two-stage diagnostic')
         source = source.replace(call, '''printf("TWO_STAGE_RUN_MODE blocking\\n");
         for (uint32_t token = 0; token < 2; ++token)
-            maps_fifo_run_tile_token(&plan, token, &idma, &eu);''')
+            maps_fifo_run_tile_token(&plan, token);''')
         (app / 'main.c').write_text(source)
     print(f'Generated isolated stage in {app}', flush=True)
     if args.generate_only:
         return
-    env = os.environ.copy()
-    tools = Path('/home/zaino/repos/toolchains')
-    llvm = tools / 'llvm20-root/usr/lib/llvm-20'
-    env['LLVM_INSTALL_DIR'] = str(llvm)
-    env['LD_LIBRARY_PATH'] = str(llvm.parent / 'x86_64-linux-gnu') + ':' + env.get('LD_LIBRARY_PATH', '')
-    env['PATH'] = str(Path(sys.executable).parent) + ':' + str(tools / 'pulp-toolchain/bin') + ':' + env['PATH']
-    env['CMAKE_BUILD_PARALLEL_LEVEL'] = '8'
+    env = magia_sdk.build_env(args.sdk_root)
     build = output / 'sdk-build'
-    config = args.sdk_root / 'targets/magia_v3/include/addr_map/tile_config.h'
-    saved_config = config.read_bytes()
     start = time.time()
-    try:
-        with (output / 'build.log').open('w') as log:
-            for build_target in ('spatz_bootrom', target):
-                command = ['make', 'build', f'tiles={mesh_size}', f'CMAKE_BUILDDIR={build}',
-                           f'maps_application_dir={app}', 'maps_token_progress=1',
-                           f'test={build_target}']
-                subprocess.run(command, cwd=args.sdk_root, env=env, stdout=log,
-                               stderr=subprocess.STDOUT, check=True)
-    finally:
-        config.write_bytes(saved_config)
-    print(f'Build completed in {time.time() - start:.1f}s; restored SDK mesh header.', flush=True)
+    with (output / 'build.log').open('w') as log:
+        magia_sdk.build(args.sdk_root, env, log, mesh_size, build, app,
+                        ('spatz_bootrom', target), ['maps_token_progress=1'])
+    print(f'Build completed in {time.time() - start:.1f}s.', flush=True)
     work = output / 'gvsoc'
     work.mkdir(exist_ok=True)
     (output / 'exit-status').unlink(missing_ok=True)
     (output / 'statistics.json').unlink(missing_ok=True)
-    command = ['stdbuf', '-oL', '-eL', str(args.sdk_root / 'gvsoc/install/bin/gvrun'), '--target', 'magia_v3',
-               '--param', f'binary={build}/bin/{target}',
-               '--work-dir', str(work), '--attr', f'magia_v3/n_tiles_x={mesh_size}',
-               '--attr', f'magia_v3/n_tiles_y={mesh_size}', '--attr',
-               f'magia_v3/spatz_romfile={build}/bin/bootrom/spatz_init.bin',
-               '--trace-level=trace', '--trace=kill-module', 'run']
+    options = ['--trace-level=trace', '--trace=kill-module']
     if args.dma_read_trace is not None:
-        command.insert(-1, f'--trace=tile-{args.dma_read_trace}-idma0/axi_read/trace:dma-read.log')
+        options.append(f'--trace=tile-{args.dma_read_trace}-idma-axi2obi/axi_read/trace:dma-read.log')
+    command = magia_sdk.gvrun_command(args.sdk_root, build, target, work, mesh_size, options)
     start = time.time()
     with (output / 'maps.log').open('w') as log:
         process = subprocess.Popen(command, cwd=args.sdk_root, env=env, stdout=log,
