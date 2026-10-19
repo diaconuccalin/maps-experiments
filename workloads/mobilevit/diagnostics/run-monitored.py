@@ -16,7 +16,6 @@ from pathlib import Path
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -35,18 +34,12 @@ def atomic_json(path, data):
     temporary.replace(path)
 
 
-def tile_source(app, execution, tile):
-    """Generated tile sources are numbered with the width of the largest tile id."""
-    width = len(str(execution['mesh']['width'] * execution['mesh']['height'] - 1))
-    return app / f'src/tiles/tile_{tile:0{width}d}.c'
-
-
 def add_prefix_outputs(app, output, execution):
     # The exporters go in the runner: the slice alias table the runtime fills is a
     # static in a header inline, so a tile source would get its own, empty copy.
     manifest, exporters, cases = [], [], []
     for tile in execution['stages'][-1]['submesh']['tile_ids']:
-        path = tile_source(app, execution, tile)
+        path = magia_sdk.tile_source(app, execution['mesh'], tile)
         source = path.read_text()
         final = source.rsplit('.outputs = ', 1)[1].split('\n  },', 1)[0]
         shapes = re.findall(r'\.shape = \{([^}]+)\}', final)
@@ -83,34 +76,12 @@ def limit_stages(mesh_root, app, output, count):
     retained = {tile for stage in execution['stages'] for tile in stage['submesh']['tile_ids']}
     atomic_json(output / 'diagnostic-execution-plan.json', execution)
     for tile in retained:
-        path = tile_source(app, execution, tile)
+        path = magia_sdk.tile_source(app, execution['mesh'], tile)
         source = path.read_text()
         for producer in re.findall(r'\.src_hartid = (\d+)', source):
             if int(producer) not in retained:
                 raise ValueError(f'Tile {tile} depends on excluded tile {producer}')
-        match = re.search(r'static const fifo_send_desc_t (\w+)\[\] = \{(.*?)\n\};', source, re.S)
-        if match:
-            blocks, depth, begin = [], 0, None
-            for i, character in enumerate(match[2]):
-                if character == '{':
-                    if depth == 0:
-                        begin = i
-                    depth += 1
-                elif character == '}':
-                    depth -= 1
-                    if depth == 0:
-                        block = match[2][begin:i + 1]
-                        destination = int(re.search(r'\.dst_hartid = (\d+)', block)[1])
-                        if destination in retained:
-                            blocks.append(block)
-            assert depth == 0
-            replacement = 'static const fifo_send_desc_t ' + match[1] + '[] = {\n' + ',\n'.join(blocks) + ',\n};' if blocks else ''
-            source = source[:match.start()] + replacement + source[match.end():]
-            source = re.sub(r'\.num_sends = \d+u,', f'.num_sends = {len(blocks)}u,', source)
-            if not blocks:
-                source = re.sub(r'\.sends = [^,]+,', '.sends = 0,', source)
-                # The L1 descriptor-copy assertion sizes the removed array.
-                source = source.replace(f'sizeof({match[1]})', '0u')
+        source, _ = magia_sdk.filter_sends(source, lambda destination: destination in retained)
         path.write_text(source)
     cmake = app / 'CMakeLists.txt'
     source = cmake.read_text()
@@ -140,7 +111,7 @@ def monitor(mesh_root, output, sdk, command, env):
             if tile in stage_for_tile:
                 raise ValueError(f'Tile {tile} assigned to multiple stages')
             stage_for_tile[tile] = stage_id
-            source = tile_source(output / 'application', execution, tile).read_text()
+            source = magia_sdk.tile_source(output / 'application', execution['mesh'], tile).read_text()
             operations[tile] = re.findall(r'\.kind = (OP_[A-Z0-9_]+),', source)
     atomic_json(output / 'stage-map.json', stages)
     tokens = 2
@@ -206,15 +177,6 @@ def monitor(mesh_root, output, sdk, command, env):
                                              'note': 'Kernel success means return code zero, not numerical verification. Tile/token processing completion may precede outgoing DMA drain.'})
         atomic_json(output / 'kernel-errors.json', errors)
 
-    def stop_simulator():
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-
     marker = re.compile(r'(MAPS_PREFIX_OUTPUT_DONE|MAPS_PREFIX_OUTPUT_ERROR|MAPS_KERNEL_STEP|MAPS_KERNEL_BEGIN|MAPS_KERNEL_DONE|MAPS_KERNEL_ERROR|MAPS_RUNTIME_ERROR|MAPS_INIT_DONE|MAPS_INIT_ERROR|MAPS_TILE_READY|MAPS_TOKEN_DONE)\b(.*)')
     values = re.compile(r'(\w+)=([^\s]+)')
     next_snapshot = 0
@@ -272,7 +234,7 @@ def monitor(mesh_root, output, sdk, command, env):
                         print('FAILURE ' + json.dumps(record), flush=True)
                         events.write(json.dumps(record) + '\n')
                         snapshot()
-                        stop_simulator()
+                        magia_sdk.stop_process_group(process)
                     for bucket, reported, event in [(computed, reported_compute, 'STAGE_COMPUTE_DONE'),
                                                       (completed, reported_completion, 'STAGE_PROCESSING_DONE')]:
                         key = (stage_id, token)

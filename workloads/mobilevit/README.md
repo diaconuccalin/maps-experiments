@@ -55,8 +55,11 @@ The diagnostics below build and simulate like `run-experiment.sh`: the SDK comes
 from `MAGIA_SDK_ROOT` (or `--sdk-root` where offered), the toolchains from the
 environment (`source ../maps-env.sh`), the SDK is built with `PULP_CORES` (default
 0) and GVSoC runs with `GVSOC_PULP_CORES` (default 8) idle PULP cores per tile.
-Each one first runs `make gvsoc` for its mesh, then builds in its own output
-directory without touching the SDK tree.
+Each one first runs `make gvsoc` for its mesh (incremental; it rebuilds only
+after GVSoC source changes) and builds in its own output directory. `make build`
+regenerates the SDK's `tile_config.h` for the mesh; the diagnostics restore it
+afterwards, but do not build another mesh from the same SDK while a diagnostic
+is building.
 
 To isolate the eight first-stage shards (original tiles 416–423) from the current
 32×32 allocation on a 4×4 mesh:

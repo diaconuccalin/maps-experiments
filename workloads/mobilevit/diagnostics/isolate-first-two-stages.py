@@ -13,26 +13,12 @@ import re
 
 import numpy as np
 
+import magia_sdk
+
 spec = importlib.util.spec_from_file_location('first_stage', Path(__file__).with_name('isolate-first-stage.py'))
 first = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(first)
 generate_first = first.generate
-
-
-def descriptor_blocks(text):
-    """Split generated array entries, without changing nested descriptors."""
-    blocks, depth, begin = [], 0, None
-    for index, character in enumerate(text):
-        if character == '{':
-            if depth == 0:
-                begin = index
-            depth += 1
-        elif character == '}':
-            depth -= 1
-            if depth == 0:
-                blocks.append(text[begin:index + 1])
-    assert depth == 0
-    return blocks
 
 
 def generate(mesh_root, output):
@@ -42,6 +28,7 @@ def generate(mesh_root, output):
     mapping = dict(zip(ids, range(13)))
     consumers = set(ids[8:])
     manifest = json.loads((output / 'manifest.json').read_text())
+    mesh = json.loads((mesh_root / 'execution-plan.json').read_text())['mesh']
     full_output = np.zeros((2, 16, 128, 128), dtype=np.float16)
     full_input = np.fromfile(original / 'data/maps_mobilevit.input_input.bin', dtype='<f2').reshape(2, 3, 256, 256)
     input_refs, input_counts, input_asm, input_declarations = [], [], [], []
@@ -66,30 +53,19 @@ def generate(mesh_root, output):
     plan_names, golden_names, declarations, counts = [], [], [], []
     asm = (app / 'data.S').read_text() + ''.join(input_asm)
     for tile, old in enumerate(ids):
-        source = (original / f'src/tiles/tile_{old:04d}.c').read_text()
-        sends_name = f'maps_mobilevit_tile_{old}_sends'
-        prefix, rest = source.split(f'static const fifo_send_desc_t {sends_name}[] = {{', 1)
-        sends_text, suffix = rest.split('\n};', 1)
-        sends = [block for block in descriptor_blocks(sends_text)
-                 if int(re.search(r'\.dst_hartid = (\d+)', block).group(1)) in consumers]
-        if sends:
-            text = prefix + f'static const fifo_send_desc_t {sends_name}[] = {{\n' + ',\n'.join(sends) + ',\n};' + suffix
-        else:
-            text = prefix + suffix
-        text = re.sub(r'\.num_sends = \d+u,', f'.num_sends = {len(sends)}u,', text)
-        if not sends:
-            text = re.sub(r'\.sends = [^,]+,', '.sends = 0,', text)
-            text = text.replace(f'sizeof({sends_name})', '0u')
+        source = magia_sdk.tile_source(original, mesh, old).read_text()
+        text, sends = magia_sdk.filter_sends(source, lambda destination: destination in consumers)
         text = re.sub(r'(\.(?:owner_hartid|src_hartid|dst_hartid|hartid) = )(\d+)(u?)(,)',
                       lambda m: m[1] + str(mapping[int(m[2])]) + m[3] + m[4], text)
         (app / f'tile_{tile}.c').write_text(text)
-        plan_names.append(f'&maps_mobilevit_tile_{old:04d}_plan')
+        plan_name = f'maps_mobilevit_tile_{magia_sdk.padded_tile_id(mesh, old)}_plan'
+        plan_names.append('&' + plan_name)
         if tile < 8:
             golden_names.append(f'{{golden_{tile}_columns, golden_{tile}_output}}')
             counts.append('{55296u, 32768u}')
-            manifest[tile]['retained_fifo_sends'] = len(sends)
+            manifest[tile]['retained_fifo_sends'] = sends
             continue
-        slices = prefix.split(f'maps_mobilevit_tile_{old}_slices[] = {{', 1)[1].split('\n};', 1)[0]
+        slices = source.split(f'maps_mobilevit_tile_{old}_slices[] = {{', 1)[1].split('\n};', 1)[0]
         shape = list(map(int, re.search(r'\.shape = \{([^}]+)\}', slices).group(1).split(',')))
         origin = list(map(int, re.search(r'\.full_offset = \{([^}]+)\}', slices).group(1).split(',')))
         assert shape[:2] == [1, 16] and shape[3] == 128
@@ -113,14 +89,14 @@ def generate(mesh_root, output):
             data.astype('<f2').tofile(path)
             asm += f'\n.section .l2_bulk.{symbol},"a",@progbits\n.balign 16\n.global {symbol}\n{symbol}:\n.incbin "{path}"\n'
             declarations.append(f'extern const uint16_t {symbol}[];')
-        declarations.append(f'extern const fifo_tile_plan_t maps_mobilevit_tile_{old:04d}_plan;')
+        declarations.append(f'extern const fifo_tile_plan_t {plan_name};')
         golden_names.append(f'{{golden_{tile}_input, golden_{tile}_output}}')
         counts.append(f'{{{count}u, {count}u}}')
         manifest.append({'original_tile': old, 'test_tile': tile, 'stage': 1,
                          'shape': shape, 'origin': origin, 'elements_per_token': count,
                          'sigmoid_reference_max_absolute_error_vs_mathematical':
                          float(np.max(np.abs(y.astype(np.float64) - mathematical.astype(np.float64)))),
-                         'retained_fifo_sends': len(sends)})
+                         'retained_fifo_sends': sends})
     (app / 'data.S').write_text(asm)
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     main = re.sub(r'static const fifo_tile_plan_t \*const plans\[13\] = \{[^\n]+',
@@ -157,13 +133,18 @@ static inline int maps_execute_operation(const tile_plan_t *plan, const op_desc_
                         + 'static const uint16_t *const input_golden[8] = {' + ', '.join(input_refs) + '};\n'
                         + 'static const uint32_t input_counts[8] = {' + ', '.join(input_counts) + '};\n'
                         + 'static const fifo_tile_plan_t *const plans')
-    main = main.replace('int main(void)', '''static uint32_t isolated_check_input(const tile_plan_t *plan, const op_desc_t *op, uint32_t slot)
+    main = main.replace('int main(void)', '''/* The runner passes only the slot, which repeats when there are fewer slots
+ * than tokens. Each tile runs its tokens in order and these operations once per
+ * token, so per-tile call counts give the token the golden data is laid out by. */
+static uint32_t input_tokens[13], received_tokens[13];
+
+static uint32_t isolated_check_input(const tile_plan_t *plan, const op_desc_t *op, uint32_t slot)
 {
-    uint32_t tile = plan->hartid, count = input_counts[tile];
+    uint32_t tile = plan->hartid, count = input_counts[tile], token = input_tokens[tile]++;
     const uint16_t *data = (const uint16_t *)local_subslice_addr(plan, &op->inputs[0], slot);
-    uint32_t bad = check(data, input_golden[tile] + slot * count, count, tile, slot, 2u);
+    uint32_t bad = check(data, input_golden[tile] + token * count, count, tile, token, 2u);
     errors[tile] += bad;
-    if (bad) printf("ISOLATED_INPUT_FAILURE tile=%u slot=%u errors=%u\\n", tile, slot, bad);
+    if (bad) printf("ISOLATED_INPUT_FAILURE tile=%u token=%u errors=%u\\n", tile, token, bad);
     return bad;
 }
 
@@ -171,9 +152,9 @@ static inline int maps_execute_operation(const tile_plan_t *plan, const op_desc_
  * FIFO slot, which is released afterwards, so check it as the operation sees it. */
 static uint32_t isolated_check_received(const tile_plan_t *plan, const op_desc_t *op, uint32_t slot)
 {
-    uint32_t tile = plan->hartid, count = counts[tile][0];
+    uint32_t tile = plan->hartid, count = counts[tile][0], token = received_tokens[tile]++;
     const uint16_t *data = (const uint16_t *)local_subslice_addr(plan, &op->inputs[0], slot);
-    uint32_t bad = check(data, golden[tile][0] + slot * count, count, tile, slot, 0u);
+    uint32_t bad = check(data, golden[tile][0] + token * count, count, tile, token, 0u);
     errors[tile] += bad;
     return bad;
 }

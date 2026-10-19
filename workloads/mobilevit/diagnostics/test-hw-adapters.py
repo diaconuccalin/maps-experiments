@@ -4,7 +4,6 @@ Uses every distinct layout/origin/parameter combination in the frozen allocation
 """
 import argparse
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -14,17 +13,7 @@ import numpy as np
 import magia_sdk
 
 
-def blocks(text):
-    result, depth, begin = [], 0, 0
-    for i, char in enumerate(text):
-        if char == '{':
-            if not depth: begin = i
-            depth += 1
-        elif char == '}':
-            depth -= 1
-            if not depth: result.append(text[begin:i+1])
-    assert depth == 0
-    return result
+blocks = magia_sdk.descriptor_blocks
 
 
 def field(text, name):
@@ -142,11 +131,11 @@ target_embed_spatz_task(TARGET ${MAPS_APPLICATION} TASK_NAME ${MAPS_APPLICATION}
     work=output/'gvsoc';work.mkdir(exist_ok=True)
     start=time.monotonic()
     with (output/'maps.log').open('w') as log:
+        proc=subprocess.Popen(magia_sdk.gvrun_command(sdk,build,'test_maps_hw_adapters',work,2),cwd=sdk,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         try:
-            proc=subprocess.run(magia_sdk.gvrun_command(sdk,build,'test_maps_hw_adapters',work,2),cwd=sdk,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=args.timeout)
-            exit_status=proc.returncode
+            exit_status=proc.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
-            exit_status='timeout'
+            magia_sdk.stop_process_group(proc);exit_status='timeout'
     text=(output/'maps.log').read_text();checks=re.findall(r'HW_CHECK case=(\d+) token=(\d+) kind=(\w+) values=(\d+) errors=(\d+) code=(-?\d+)',text)
     passed=exit_status==0 and len(checks)==len(cases)*2 and all(int(c[4])==0 and int(c[5])==0 for c in checks)
     stats={'passed':passed,'exit_status':exit_status,'wall_seconds':time.monotonic()-start,'cases':len(cases),'checks':len(checks),'values':sum(int(c[3]) for c in checks),'errors':sum(int(c[4]) for c in checks)}

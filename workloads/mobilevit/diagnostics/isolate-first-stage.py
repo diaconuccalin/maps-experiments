@@ -9,10 +9,8 @@ element against a host reference, including FP16 rounding after each FMA.
 
 import argparse
 import json
-import os
 from pathlib import Path
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -42,9 +40,10 @@ def generate(mesh_root, output):
                           count=432, offset=1964384).reshape(16, 27)
     bias = np.fromfile(original / "data/maps_mobilevit.initializers.bin", dtype='<f2',
                        count=16, offset=1965248)
+    mesh = json.loads((mesh_root / 'execution-plan.json').read_text())['mesh']
     declarations, plans, refs, manifest = [], [], [], []
     for tile, old in enumerate(range(416, 424)):
-        source = (original / f"src/tiles/tile_{old:04d}.c").read_text()
+        source = magia_sdk.tile_source(original, mesh, old).read_text()
         slices_text = source.split(f"static const slice_desc_t maps_mobilevit_tile_{old}_slices[] = {{", 1)[1].split("\n};", 1)[0]
         shapes = [list(map(int, s.split(','))) for s in re.findall(r'\.shape = \{([^}]+)\}', slices_text)]
         origins = [list(map(int, s.split(','))) for s in re.findall(r'\.full_offset = \{([^}]+)\}', slices_text)]
@@ -75,17 +74,11 @@ def generate(mesh_root, output):
             declarations.append(f"extern const uint16_t {symbol}[];")
         # Keep the original descriptors, including absolute shard origins and
         # every slot offset. Only physical owners and the stage boundary change.
-        prefix = source.split(f"static const fifo_send_desc_t maps_mobilevit_tile_{old}_sends[]", 1)[0]
-        plan_text = source[source.index('_Static_assert(FIFO_HEADER_SIZE'):]
-        plan_text = re.sub(r'\.num_sends = \d+u,', '.num_sends = 0u,', plan_text)
-        plan_text = re.sub(r'\.sends = [^,]+,', '.sends = 0,', plan_text)
-        # The sends array is gone; the L1 descriptor-copy assertion sizes it.
-        plan_text = plan_text.replace(f'sizeof(maps_mobilevit_tile_{old}_sends)', '0u')
-        text = prefix + plan_text
+        text, _ = magia_sdk.filter_sends(source, lambda destination: False)
         text = text.replace(f'.owner_hartid = {old},', f'.owner_hartid = {tile},')
         text = text.replace(f'.hartid = {old}u,', f'.hartid = {tile}u,')
         (app / f"tile_{tile}.c").write_text(text)
-        name = f"maps_mobilevit_tile_{old:04d}_plan"
+        name = f"maps_mobilevit_tile_{magia_sdk.padded_tile_id(mesh, old)}_plan"
         declarations.append(f"extern const fifo_tile_plan_t {name};")
         plans.append(f"&{name}")
         refs.append(f"{{golden_{tile}_columns, golden_{tile}_output}}")
@@ -314,12 +307,7 @@ def main(target='maps_mobilevit_first_stage', output_name='first-stage-4x4', mes
             elif time.time() - start > args.timeout:
                 stopped_reason = f'Diagnostic timed out after {args.timeout}s.'
             if stopped_reason:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                magia_sdk.stop_process_group(process)
                 break
             time.sleep(1)
         result = process.returncode
